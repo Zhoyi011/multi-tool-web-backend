@@ -7,6 +7,8 @@ import requests
 from werkzeug.utils import secure_filename
 import tempfile
 import atexit
+import logging
+import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -18,6 +20,25 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['CONVERTED_FOLDER'], exist_ok=True)
 
 tasks = {}
+
+log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format='%(asctime)s %(levelname)s %(message)s')
+
+def set_task(task_id, **kwargs):
+    current = tasks.get(task_id, {})
+    current.update(kwargs)
+    tasks[task_id] = current
+    return tasks[task_id]
+
+def append_log(task_id, message):
+    entry = tasks.get(task_id)
+    if not entry:
+        tasks[task_id] = {}
+        entry = tasks[task_id]
+    logs = entry.get('logs') or []
+    logs.append(message)
+    entry['logs'] = logs
+    tasks[task_id] = entry
 
 def cleanup_old_files():
     """清理旧文件"""
@@ -34,65 +55,57 @@ def cleanup_old_files():
 
 atexit.register(cleanup_old_files)
 
-# MP4转MP3 - 使用在线转换API
-def convert_mp4_to_mp3_online(task_id, input_path, output_path, output_filename):
+def _get_ffmpeg_path():
     try:
-        # 使用在线转换服务
-        conversion_url = "https://api.online-convert.com/convert-to-mp3"
-        
-        # 上传文件到在线服务
-        with open(input_path, 'rb') as f:
-            files = {'file': (output_filename, f, 'video/mp4')}
-            response = requests.post(conversion_url, files=files, timeout=300)
-        
-        if response.status_code == 200:
-            # 下载转换后的文件
-            with open(output_path, 'wb') as f:
-                f.write(response.content)
-            
-            tasks[task_id] = {
-                'status': 'completed',
-                'output_filename': output_filename,
-                'output_path': output_path
-            }
-        else:
-            tasks[task_id] = {
-                'status': 'error',
-                'error': '在线转换服务失败'
-            }
-            
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+def convert_mp4_to_mp3_task(task_id, input_path, output_path, output_filename):
+    try:
+        set_task(task_id, status='processing', progress=10)
+        append_log(task_id, '开始MP4转MP3')
+        ffmpeg_path = _get_ffmpeg_path()
+        if ffmpeg_path:
+            os.environ['FFMPEG_BINARY'] = ffmpeg_path
+        from pydub import AudioSegment
+        if ffmpeg_path:
+            AudioSegment.converter = ffmpeg_path
+        audio = AudioSegment.from_file(input_path, format='mp4')
+        set_task(task_id, progress=90)
+        audio.export(output_path, format='mp3')
+        set_task(task_id, status='completed', output_filename=output_filename, output_path=output_path, progress=100)
+        append_log(task_id, 'MP3生成完成')
+        logging.info('mp4-to-mp3 成功 %s', output_filename)
     except Exception as e:
-        tasks[task_id] = {
-            'status': 'error',
-            'error': f'转换失败: {str(e)}'
-        }
+        set_task(task_id, status='error', error=f'转换失败: {str(e)}')
+        append_log(task_id, traceback.format_exc())
+        logging.error('mp4-to-mp3 失败: %s', e)
     finally:
-        # 清理输入文件
         try:
             os.remove(input_path)
-        except:
+        except Exception:
             pass
 
 # PDF转Word - 使用pdf2docx
 def convert_pdf_to_docx(task_id, input_path, output_path, output_filename):
     try:
+        set_task(task_id, status='processing', progress=10)
+        append_log(task_id, '开始PDF转Word')
         from pdf2docx import Converter
         
         cv = Converter(input_path)
         cv.convert(output_path)
         cv.close()
-        
-        tasks[task_id] = {
-            'status': 'completed',
-            'output_filename': output_filename,
-            'output_path': output_path
-        }
+        set_task(task_id, status='completed', output_filename=output_filename, output_path=output_path, progress=100)
+        append_log(task_id, 'Word生成完成')
+        logging.info('pdf-to-word 成功 %s', output_filename)
         
     except Exception as e:
-        tasks[task_id] = {
-            'status': 'error',
-            'error': f'PDF转换失败: {str(e)}'
-        }
+        set_task(task_id, status='error', error=f'PDF转换失败: {str(e)}')
+        append_log(task_id, traceback.format_exc())
+        logging.error('pdf-to-word 失败: %s', e)
     finally:
         try:
             os.remove(input_path)
@@ -102,10 +115,14 @@ def convert_pdf_to_docx(task_id, input_path, output_path, output_filename):
 # YouTube下载 - 使用yt-dlp
 def download_youtube_video(task_id, url, format_type, output_path, output_filename):
     try:
+        set_task(task_id, status='processing', progress=10)
+        append_log(task_id, '开始下载链接')
         import yt_dlp
         
+        ffmpeg_path = _get_ffmpeg_path()
+        base_out = output_path.replace('.mp3', '').replace('.mp4', '')
         ydl_opts = {
-            'outtmpl': output_path.replace('.mp3', '').replace('.mp4', ''),
+            'outtmpl': base_out,
             'quiet': True,
         }
         
@@ -117,6 +134,8 @@ def download_youtube_video(task_id, url, format_type, output_path, output_filena
                     'preferredcodec': 'mp3',
                 }],
             })
+            if ffmpeg_path:
+                ydl_opts['ffmpeg_location'] = ffmpeg_path
         else:
             ydl_opts.update({
                 'format': 'best[height<=720]',
@@ -124,23 +143,15 @@ def download_youtube_video(task_id, url, format_type, output_path, output_filena
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
-        # 找到实际生成的文件
-        actual_output_path = output_path
-        if format_type == 'mp3':
-            actual_output_path = output_path.replace('.mp4', '.mp3')
-        
-        tasks[task_id] = {
-            'status': 'completed',
-            'output_filename': output_filename,
-            'output_path': actual_output_path
-        }
+        actual_output_path = output_path if format_type != 'mp3' else output_path.replace('.mp4', '.mp3')
+        set_task(task_id, status='completed', output_filename=output_filename, output_path=actual_output_path, progress=100)
+        append_log(task_id, '下载完成')
+        logging.info('link 下载成功 %s', output_filename)
         
     except Exception as e:
-        tasks[task_id] = {
-            'status': 'error',
-            'error': f'YouTube下载失败: {str(e)}'
-        }
+        set_task(task_id, status='error', error=f'YouTube下载失败: {str(e)}')
+        append_log(task_id, traceback.format_exc())
+        logging.error('link 下载失败: %s', e)
 
 @app.route('/')
 def home():
@@ -176,14 +187,9 @@ def convert_mp4_to_mp3():
         output_filename = filename.replace('.mp4', '.mp3').replace('.MP4', '.mp3')
         output_path = os.path.join(app.config['CONVERTED_FOLDER'], f"{task_id}_{output_filename}")
         
-        tasks[task_id] = {
-            'status': 'processing',
-            'input_filename': filename
-        }
-        
-        # 使用在线转换服务
+        set_task(task_id, status='processing', input_filename=filename, progress=0)
         thread = threading.Thread(
-            target=convert_mp4_to_mp3_online,
+            target=convert_mp4_to_mp3_task,
             args=(task_id, input_path, output_path, output_filename)
         )
         thread.start()
@@ -220,10 +226,7 @@ def convert_pdf_to_word():
         output_filename = filename.replace('.pdf', '.docx').replace('.PDF', '.docx')
         output_path = os.path.join(app.config['CONVERTED_FOLDER'], f"{task_id}_{output_filename}")
         
-        tasks[task_id] = {
-            'status': 'processing',
-            'input_filename': filename
-        }
+        set_task(task_id, status='processing', input_filename=filename, progress=0)
         
         thread = threading.Thread(
             target=convert_pdf_to_docx,
@@ -259,9 +262,7 @@ def convert_link():
         output_filename = f"youtube_video.{format_type}"
         output_path = os.path.join(app.config['CONVERTED_FOLDER'], f"{task_id}_{output_filename}")
         
-        tasks[task_id] = {
-            'status': 'processing'
-        }
+        set_task(task_id, status='processing', progress=0)
         
         thread = threading.Thread(
             target=download_youtube_video,
@@ -296,6 +297,8 @@ def download_file(task_id):
         return jsonify({'error': '文件尚未转换完成'}), 400
     
     try:
+        if not os.path.isfile(task['output_path']):
+            return jsonify({'error': '文件不存在或已清理'}), 404
         return send_file(
             task['output_path'],
             as_attachment=True,
