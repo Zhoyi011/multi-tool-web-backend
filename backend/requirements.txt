@@ -4,3 +4,4 @@ werkzeug==2.3.7
 pydub==0.25.1
 pdf2docx==0.5.7
 yt-dlp==2023.11.16
+imageio-ffmpeg==0.5.1
